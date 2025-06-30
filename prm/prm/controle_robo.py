@@ -13,13 +13,15 @@ from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import OccupancyGrid
 
-# --- Enumeração dos Estados do Robô ---
+# --- Enumeração dos Estados do Robô (MODIFICADO) ---
 class EstadoRobo(Enum):
     AGUARDANDO_COMANDO = auto()
     EXPLORANDO = auto()
     BANDEIRA_DETECTADA = auto()
     NAVEGANDO_PARA_BANDEIRA = auto()
     POSICIONANDO_PARA_COLETA = auto()
+    COLETANDO_BANDEIRA = auto()      # NOVO ESTADO
+    RETORNANDO_A_BASE = auto()       # NOVO ESTADO
     MISSAO_CONCLUIDA = auto()
 
 # --- Classe Principal do Nodo de Controle do Robô ---
@@ -39,11 +41,11 @@ class ControleRobo(Node):
         self.cor_bandeira_bgr_superior = np.array([40, 40, 40])
 
         # --- Limiares e Parâmetros de Controle ---
-        self.limiar_distancia_posicionamento = 0.2  # metros 
-        self.limiar_angulo_para_posicionamento_final = 0.1 # radianos 
-        self.distancia_final_ideal = 0.25 # metros
-        self.tolerancia_distancia = 0.05  # metros
-        self.tolerancia_angulo = 0.05     # radianos
+        self.limiar_distancia_posicionamento = 0.2
+        self.limiar_angulo_para_posicionamento_final = 0.1
+        self.distancia_final_ideal = 0.25
+        self.tolerancia_distancia = 0.05
+        self.tolerancia_angulo = 0.05
 
         self.estado_atual = EstadoRobo.EXPLORANDO
 
@@ -51,6 +53,8 @@ class ControleRobo(Node):
         self.obstaculo_a_frente = False
         self.bandeira_visivel = False
         self.posicao_bandeira_relativa = None
+        self.posicao_inicial = None # NOVO: Armazena a posição inicial
+        self.odom_atual = None      # NOVO: Armazena a odometria atual
 
         # LIDAR
         self.distancia_lidar_frontal = float('inf') 
@@ -84,7 +88,7 @@ class ControleRobo(Node):
         self.limiar_angulo_para_avancar_nav = 0.25
         self.Kp_angular_nav = 0.6
         self.Kp_linear_nav = 0.1  
-        self.velocidade_max_aproximacao_nav = 0.15
+        self.velocidade_max_aproximacao_nav = 0.25
         self.velocidade_min_aproximacao_nav = 0.04
         self.velocidade_max_angular_nav = 0.5
 
@@ -93,6 +97,17 @@ class ControleRobo(Node):
         self.Kp_pos_lin = 0.08
         self.velocidade_max_linear_pos = 0.05
         self.velocidade_max_angular_pos = 0.2
+        
+        # NOVO: Para COLETANDO_BANDEIRA
+        self.tempo_inicio_coleta = 0.0
+        self.duracao_coleta_s = 3.0  # Robô para por 3 segundos
+
+        # NOVO: Para RETORNANDO_A_BASE
+        self.limiar_distancia_base = 0.25 # metros
+        self.Kp_angular_base = 0.7
+        self.Kp_linear_base = 0.15
+        self.velocidade_max_retorno = 0.25
+        self.limiar_angulo_retorno_base = 0.2 # radianos
 
         # Para Desvio Inteligente de Obstáculo
         self.velocidade_giro_desvio_obstaculo = 0.9
@@ -112,6 +127,29 @@ class ControleRobo(Node):
         self.timer_period = 0.1
         self.timer = self.create_timer(self.timer_period, self.loop_maquina_estados)
         self.get_logger().info("ControleRobo inicializado e pronto.")
+        
+        self.ultimo_desvio_tempo = 0.0
+        self.tempo_cooldown_pos_desvio = 2.0  # segundos
+
+        # NOVO: estado de avanço forçado
+        self.em_avanco_pos_desvio = False
+        self.duracao_avanco_pos_desvio = 3  # segundos de avanço após desvio
+
+        # Controle para avanço após desvio na navegação para bandeira
+        self.ultimo_desvio_nav_tempo = 0.0
+        self.em_avanco_pos_desvio_nav = False
+        self.duracao_avanco_pos_desvio_nav = 3  # segundos para avançar após desvio
+
+
+    # --- Funções Auxiliares (NOVO) ---
+    def euler_from_quaternion(self, quaternion):
+        x = quaternion.x
+        y = quaternion.y
+        z = quaternion.z
+        w = quaternion.w
+        siny_cosp = 2 * (w * z + x * y)
+        cosy_cosp = 1 - 2 * (y * y + z * z)
+        return math.atan2(siny_cosp, cosy_cosp)
 
     # --- Callbacks de Sensores ---
     def map_callback(self, msg: OccupancyGrid):
@@ -126,7 +164,6 @@ class ControleRobo(Node):
             self.min_dist_lado_direito_fisico = float('inf')
             return
 
-        # --- Detecção Frontal com validação melhorada ---
         angulo_abertura_frontal_graus = 30 
         if num_ranges == 360:
             offset_frontal = angulo_abertura_frontal_graus
@@ -136,15 +173,10 @@ class ControleRobo(Node):
         indices_frente = list(range(num_ranges - offset_frontal, num_ranges)) + \
                            list(range(0, offset_frontal + 1))
         
-        distancias_frente_raw = []
-        for i in indices_frente:
-            if 0 <= i < num_ranges and msg.ranges[i] != float('inf') and msg.ranges[i] != float('nan') and msg.ranges[i] > self.min_valid_range:
-                distancias_frente_raw.append(msg.ranges[i])
+        distancias_frente_raw = [d for i in indices_frente if 0 <= i < num_ranges and msg.ranges[i] > self.min_valid_range and not (math.isinf(msg.ranges[i]) or math.isnan(msg.ranges[i])) for d in [msg.ranges[i]]]
         
         if distancias_frente_raw:
             self.distancia_lidar_frontal = min(distancias_frente_raw)
-            
-            # Contagem consistente de obstáculos
             if self.distancia_lidar_frontal < self.limiar_obstaculo_frontal:
                 self.obstacle_count += 1
                 if self.obstacle_count >= self.consistent_obstacle_threshold:
@@ -154,325 +186,316 @@ class ControleRobo(Node):
                     self.obstaculo_a_frente = True
             else:
                 self.obstacle_count = 0
-                if self.obstaculo_a_frente:
-                    self.get_logger().info('Caminho FRONTAL livre.')
+                if self.obstaculo_a_frente: self.get_logger().info('Caminho FRONTAL livre.')
                 self.obstaculo_a_frente = False
         else:
             self.distancia_lidar_frontal = float('inf')
             self.obstaculo_a_frente = False
 
-        # --- Detecção Lateral ---
-        angulo_inicio_setor_lateral_graus = 20
-        angulo_fim_setor_lateral_graus = 75
-
-        # Setor ESQUERDO FÍSICO
-        idx_inicio_esq_fisico = angulo_inicio_setor_lateral_graus
-        idx_fim_esq_fisico = angulo_fim_setor_lateral_graus
+        angulo_inicio_setor_lateral_graus, angulo_fim_setor_lateral_graus = 20, 75
         
-        indices_setor_esquerdo_fisico = []
-        if 0 <= idx_inicio_esq_fisico < num_ranges and 0 <= idx_fim_esq_fisico < num_ranges and idx_inicio_esq_fisico <= idx_fim_esq_fisico:
-            indices_setor_esquerdo_fisico = list(range(idx_inicio_esq_fisico, idx_fim_esq_fisico + 1))
-        
-        distancias_setor_esquerdo_raw = []
-        for i in indices_setor_esquerdo_fisico:
-            if msg.ranges[i] != float('inf') and msg.ranges[i] != float('nan') and msg.ranges[i] > self.min_valid_range:
-                distancias_setor_esquerdo_raw.append(msg.ranges[i])
-        
-        if distancias_setor_esquerdo_raw:
-            self.min_dist_lado_esquerdo_fisico = min(distancias_setor_esquerdo_raw)
-        else:
-            self.min_dist_lado_esquerdo_fisico = float('inf')
+        idx_inicio_esq = angulo_inicio_setor_lateral_graus
+        idx_fim_esq = angulo_fim_setor_lateral_graus
+        dist_esq = [d for i in range(idx_inicio_esq, idx_fim_esq + 1) if 0 <= i < num_ranges and msg.ranges[i] > self.min_valid_range and not (math.isinf(msg.ranges[i]) or math.isnan(msg.ranges[i])) for d in [msg.ranges[i]]]
+        self.min_dist_lado_esquerdo_fisico = min(dist_esq) if dist_esq else float('inf')
 
-        # Setor DIREITO FÍSICO
-        idx_inicio_dir_fisico = num_ranges - angulo_fim_setor_lateral_graus
-        idx_fim_dir_fisico = num_ranges - angulo_inicio_setor_lateral_graus
-        
-        indices_setor_direito_fisico = []
-        if 0 <= idx_inicio_dir_fisico < num_ranges and 0 <= idx_fim_dir_fisico < num_ranges and idx_inicio_dir_fisico <= idx_fim_dir_fisico:
-            indices_setor_direito_fisico = list(range(idx_inicio_dir_fisico, idx_fim_dir_fisico + 1))
+        idx_inicio_dir = num_ranges - angulo_fim_setor_lateral_graus
+        idx_fim_dir = num_ranges - angulo_inicio_setor_lateral_graus
+        dist_dir = [d for i in range(idx_inicio_dir, idx_fim_dir + 1) if 0 <= i < num_ranges and msg.ranges[i] > self.min_valid_range and not (math.isinf(msg.ranges[i]) or math.isnan(msg.ranges[i])) for d in [msg.ranges[i]]]
+        self.min_dist_lado_direito_fisico = min(dist_dir) if dist_dir else float('inf')
 
-        distancias_setor_direito_raw = []
-        for i in indices_setor_direito_fisico:
-            if msg.ranges[i] != float('inf') and msg.ranges[i] != float('nan') and msg.ranges[i] > self.min_valid_range:
-                distancias_setor_direito_raw.append(msg.ranges[i])
-
-        if distancias_setor_direito_raw:
-            self.min_dist_lado_direito_fisico = min(distancias_setor_direito_raw)
-        else:
-            self.min_dist_lado_direito_fisico = float('inf')
-
-    # --- Callbacks de Câmera ---
     def camera_callback(self, msg: Image):
         try:
             cv_image_bgr = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         except CvBridgeError as e:
             self.get_logger().error(f"Erro ao converter imagem com CvBridge: {e}")
-            self.bandeira_visivel = False
-            self.posicao_bandeira_relativa = None
-            self.area_bandeira_detectada = 0.0
+            self.bandeira_visivel = False; self.posicao_bandeira_relativa = None; self.area_bandeira_detectada = 0.0
             return
 
         mask_bandeira = cv2.inRange(cv_image_bgr, self.cor_bandeira_bgr_inferior, self.cor_bandeira_bgr_superior)
-
         try:
-            mask_msg = self.bridge.cv2_to_imgmsg(mask_bandeira, encoding="mono8")
-            self.mask_publisher.publish(mask_msg)
+            self.mask_publisher.publish(self.bridge.cv2_to_imgmsg(mask_bandeira, encoding="mono8"))
         except CvBridgeError as e:
             self.get_logger().error(f'Erro ao converter/publicar máscara de debug: {e}')
 
         height, width = cv_image_bgr.shape[:2]
-        center_x_image = width // 2
-
         contours, _ = cv2.findContours(mask_bandeira, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         if contours:
             maior_contorno = max(contours, key=cv2.contourArea)
             self.area_bandeira_detectada = cv2.contourArea(maior_contorno)
-            limiar_area_minima = 50 
-
-            if self.area_bandeira_detectada > limiar_area_minima:
+            if self.area_bandeira_detectada > 50:
                 M = cv2.moments(maior_contorno)
                 if M["m00"] != 0:
                     cX = int(M["m10"] / M["m00"])
+                    _x, _y, _w, h_rect = cv2.boundingRect(maior_contorno)
                     
-                    angulo_horizontal_rad = 0.0
-                    if (width / 2.0) > 1e-3:
-                        angulo_horizontal_rad = (float(cX - center_x_image) / (width / 2.0)) * (1.57 / 2.0)
-
-                    # Estimativa de Distância Visual
-                    _x_rect, _y_rect, w_rect_pixels, h_rect_pixels = cv2.boundingRect(maior_contorno)
-                    distancia_visual_calculada_m = float('inf')
-                    if h_rect_pixels > 0:
-                        distancia_visual_calculada_m = (self.ALTURA_REAL_BANDEIRA_M * self.distancia_focal_px) / h_rect_pixels
+                    angulo_horizontal_rad = (float(cX - (width // 2)) / (width / 2.0)) * (1.57 / 2.0)
+                    dist_visual_m = (self.ALTURA_REAL_BANDEIRA_M * self.distancia_focal_px) / h_rect if h_rect > 0 else float('inf')
                     
-                    if not self.bandeira_visivel:
-                         self.get_logger().info(f"BANDEIRA VISÍVEL! (Cor BGR, Área: {self.area_bandeira_detectada:.1f}, DistVis~{distancia_visual_calculada_m:.2f}m, Angulo~{angulo_horizontal_rad:.2f}rad)")
-                    
+                    if not self.bandeira_visivel: self.get_logger().info(f"BANDEIRA VISÍVEL! (Área: {self.area_bandeira_detectada:.1f}, DistVis~{dist_visual_m:.2f}m, Angulo~{angulo_horizontal_rad:.2f}rad)")
                     self.bandeira_visivel = True
-                    self.posicao_bandeira_relativa = (distancia_visual_calculada_m, angulo_horizontal_rad)
-                else:
-                    self.bandeira_visivel = False
-                    self.posicao_bandeira_relativa = None
-                    self.area_bandeira_detectada = 0.0
+                    self.posicao_bandeira_relativa = (dist_visual_m, angulo_horizontal_rad)
+                else: self.bandeira_visivel = False
             else:
-                if self.bandeira_visivel: self.get_logger().info("Bandeira não mais proeminente (área pequena).")
+                if self.bandeira_visivel: self.get_logger().info("Bandeira não mais proeminente.")
                 self.bandeira_visivel = False
-                self.posicao_bandeira_relativa = None
-                self.area_bandeira_detectada = 0.0
         else:
-            if self.bandeira_visivel: self.get_logger().info("Bandeira perdida de vista (sem contornos).")
+            if self.bandeira_visivel: self.get_logger().info("Bandeira perdida de vista.")
             self.bandeira_visivel = False
+
+        if not self.bandeira_visivel:
             self.posicao_bandeira_relativa = None
             self.area_bandeira_detectada = 0.0
 
     def imu_callback(self, msg: Imu): pass
-    def odom_callback(self, msg: Odometry): pass
+    
+    # --- Callback de Odometria (MODIFICADO) ---
+    def odom_callback(self, msg: Odometry):
+        self.odom_atual = msg
+        # Salva a primeira leitura de odometria como a posição inicial (base)
+        if self.posicao_inicial is None:
+            self.posicao_inicial = msg
+            pos = self.posicao_inicial.pose.pose.position
+            self.get_logger().info(f"Posição inicial (base) salva: (x={pos.x:.2f}, y={pos.y:.2f})")
 
-    # --- Loop Principal da Máquina de Estados ---
+    # --- Loop Principal da Máquina de Estados (MODIFICADO) ---
     def loop_maquina_estados(self):
         try:
             twist = Twist() 
-
-            if self.estado_atual == EstadoRobo.AGUARDANDO_COMANDO:
-                twist = self.logica_aguardando_comando()
-            elif self.estado_atual == EstadoRobo.EXPLORANDO:
-                twist = self.logica_explorando()
-            elif self.estado_atual == EstadoRobo.BANDEIRA_DETECTADA:
-                twist = self.logica_bandeira_detectada()
-            elif self.estado_atual == EstadoRobo.NAVEGANDO_PARA_BANDEIRA:
-                twist = self.logica_navegando_para_bandeira()
-            elif self.estado_atual == EstadoRobo.POSICIONANDO_PARA_COLETA:
-                twist = self.logica_posicionando_para_coleta()
-            elif self.estado_atual == EstadoRobo.MISSAO_CONCLUIDA:
-                twist = self.logica_missao_concluida()
-            
+            if self.estado_atual == EstadoRobo.AGUARDANDO_COMANDO: twist = self.logica_aguardando_comando()
+            elif self.estado_atual == EstadoRobo.EXPLORANDO: twist = self.logica_explorando()
+            elif self.estado_atual == EstadoRobo.BANDEIRA_DETECTADA: twist = self.logica_bandeira_detectada()
+            elif self.estado_atual == EstadoRobo.NAVEGANDO_PARA_BANDEIRA: twist = self.logica_navegando_para_bandeira()
+            elif self.estado_atual == EstadoRobo.POSICIONANDO_PARA_COLETA: twist = self.logica_posicionando_para_coleta()
+            elif self.estado_atual == EstadoRobo.COLETANDO_BANDEIRA: twist = self.logica_coletando_bandeira()
+            elif self.estado_atual == EstadoRobo.RETORNANDO_A_BASE: twist = self.logica_retornando_a_base()
+            elif self.estado_atual == EstadoRobo.MISSAO_CONCLUIDA: twist = self.logica_missao_concluida()
             self.cmd_vel_pub.publish(twist)
         except Exception as e:
-            self.get_logger().error(f"Erro na máquina de estado {str(e)}")
-            return Twist()
+            self.get_logger().error(f"Erro na máquina de estados: {str(e)}")
 
     # --- Funções de Transição de Estado ---
     def mudar_estado(self, novo_estado: EstadoRobo):
         if self.estado_atual != novo_estado:
             self.get_logger().info(f"Mudando de estado: {self.estado_atual.name} -> {novo_estado.name}")
             self.estado_atual = novo_estado
-            # Reseta contagem de giros consecutivos ao mudar de estado
-            self.consecutive_right_turns = 0
+            self.consecutive_right_turns = 0 # Reseta contagem de giros
+            
+            # NOVO: Inicia o timer ao entrar no estado de coleta
+            if novo_estado == EstadoRobo.COLETANDO_BANDEIRA:
+                self.tempo_inicio_coleta = self.get_clock().now().nanoseconds / 1e9
 
     # --- Lógicas de Estado ---
-    def logica_aguardando_comando(self):
-        return Twist()
+    def logica_aguardando_comando(self): return Twist()
 
-    # --- Lógicas de Exploranção ---
     def logica_explorando(self):
-        twist = Twist()
-        velocidade_linear_exploracao = 0.15 
-        # Verifica se a bandeira foi detectada
         if self.bandeira_visivel and self.posicao_bandeira_relativa is not None:
-            self.get_logger().info("Explorando: Bandeira detectada! Mudando para BANDEIRA_DETECTADA.")
             self.mudar_estado(EstadoRobo.BANDEIRA_DETECTADA)
             return Twist()
         
-        current_time = self.get_clock().now().nanoseconds / 1e9
-        
-        # Melhora a lógica de desvio de obstáculo
-        if (self.obstaculo_a_frente and 
-            (current_time - self.last_obstacle_time) > self.obstacle_avoidance_timeout):
-            self.get_logger().warn("STUCK DETECTADO! Tentar manobra de fuga.")
-            twist.linear.x = -0.1
-            twist.angular.z = 0.5
-            self.last_obstacle_time = current_time  # Reseta o timer
-            return twist
-            
-        elif self.obstaculo_a_frente:
-            self.get_logger().info("Explorando: Obstáculo frontal detectado. Decidindo direção inteligente do giro...")
+        twist = Twist()
+        if self.obstaculo_a_frente:
             twist.linear.x = 0.0
-            
-            # Decisão de desvio com base no espaço lateral
-            if (self.min_dist_lado_direito_fisico > 
-                (self.min_dist_lado_esquerdo_fisico + self.margem_decisao_lateral_desvio)):
-                self.get_logger().info(f"--> EXPLORANDO: Mais espaço à DIREITA FÍSICA ({self.min_dist_lado_direito_fisico:.2f}m > {self.min_dist_lado_esquerdo_fisico:.2f}m + margem). Virando para DIREITA.")
+            if self.min_dist_lado_direito_fisico > (self.min_dist_lado_esquerdo_fisico + self.margem_decisao_lateral_desvio):
                 twist.angular.z = -self.velocidade_giro_desvio_obstaculo
-                self.consecutive_right_turns += 1
-            elif (self.min_dist_lado_esquerdo_fisico > 
-                  (self.min_dist_lado_direito_fisico + self.margem_decisao_lateral_desvio)):
-                self.get_logger().info(f"--> EXPLORANDO: Mais espaço à ESQUERDA FÍSICA ({self.min_dist_lado_esquerdo_fisico:.2f}m > {self.min_dist_lado_direito_fisico:.2f}m + margem). Virando para ESQUERDA.")
+            elif self.min_dist_lado_esquerdo_fisico > (self.min_dist_lado_direito_fisico + self.margem_decisao_lateral_desvio):
                 twist.angular.z = self.velocidade_giro_desvio_obstaculo
-                self.consecutive_right_turns = 0
-            else:
-                # Decisão aleatória quando os espaços são similares
-                if self.consecutive_right_turns >= self.max_consecutive_turns:
-                    self.get_logger().info("EXPLORANDO: Muitos giros consecutivos à DIREITA. Virando para ESQUERDA.")
-                    twist.angular.z = self.velocidade_giro_desvio_obstaculo
-                    self.consecutive_right_turns = 0
-                else:
-                    turn_direction = random.choice([-1, 1])  
-                    self.get_logger().info(f"--> EXPLORANDO: Espaço lateral similar. Virando {'DIREITA' if turn_direction == -1 else 'ESQUERDA'} (aleatório).")
-                    twist.angular.z = turn_direction * self.velocidade_giro_desvio_obstaculo
-                    if turn_direction == -1:
-                        self.consecutive_right_turns += 1
-                    else:
-                        self.consecutive_right_turns = 0
+            else: # Aleatório se o espaço for similar
+                twist.angular.z = random.choice([-1, 1]) * self.velocidade_giro_desvio_obstaculo
         else:
-            twist.linear.x = velocidade_linear_exploracao
+            twist.linear.x = 0.25 # velocidade_linear_exploracao
             twist.angular.z = 0.0
-            self.consecutive_right_turns = 0
-            
         return twist
 
-    # --- Lógica quando a bandeira é detectada ---
     def logica_bandeira_detectada(self):
-        twist = Twist() 
-        self.get_logger().info(f"Bandeira Detectada! Posição relativa (DistVis, AngCam): {self.posicao_bandeira_relativa}")
-        
-        if self.posicao_bandeira_relativa is not None and self.bandeira_visivel:
+        if self.bandeira_visivel and self.posicao_bandeira_relativa is not None:
             self.mudar_estado(EstadoRobo.NAVEGANDO_PARA_BANDEIRA)
         else: 
-            self.get_logger().warn("Bandeira detectada mas info inválida/perdida rapidamente. Voltando a EXPLORAR.")
-            self.bandeira_visivel = False
-            self.posicao_bandeira_relativa = None
             self.mudar_estado(EstadoRobo.EXPLORANDO)
-        return twist
+        return Twist()
 
-    # --- Lógica de Navegação para a Bandeira ---
     def logica_navegando_para_bandeira(self):
-        twist = Twist()
-        
         if not self.bandeira_visivel or self.posicao_bandeira_relativa is None:
-            self.get_logger().warn("Navegando: Bandeira perdida/inválida. Voltando a EXPLORAR.")
             self.mudar_estado(EstadoRobo.EXPLORANDO)
-            return twist
+            return Twist()
 
-        distancia_visual_bandeira, angulo_bandeira_camera = self.posicao_bandeira_relativa
-        self.get_logger().info(f"Navegando: Angulo_CAM: {angulo_bandeira_camera:.2f}rad, Dist_VISUAL: {distancia_visual_bandeira:.2f}m, Obst_Imediato: {self.obstaculo_a_frente}")
+        dist_vis, ang_cam = self.posicao_bandeira_relativa
+        twist = Twist()
+        tempo_atual = self.get_clock().now().nanoseconds / 1e9
 
-        # Desvio de obstáculo imediato
+        # --- DESVIO DE OBSTÁCULO ---
         if self.obstaculo_a_frente:
-            self.get_logger().warn("Navegando: Obstáculo IMEDIATO. Desviando com prioridade (escolha inteligente)...")
+            self.get_logger().warn("Navegando: Obstáculo à frente. Executando desvio inteligente...")
             twist.linear.x = 0.0
-
-            if (self.min_dist_lado_direito_fisico > 
-                (self.min_dist_lado_esquerdo_fisico + self.margem_decisao_lateral_desvio)):
-                self.get_logger().info(f"--> NAVEGANDO: Mais espaço à DIREITA FÍSICA ({self.min_dist_lado_direito_fisico:.2f}m). Virando para DIREITA.")
+            if self.min_dist_lado_direito_fisico > (self.min_dist_lado_esquerdo_fisico + self.margem_decisao_lateral_desvio):
                 twist.angular.z = -self.velocidade_giro_desvio_obstaculo
-            elif (self.min_dist_lado_esquerdo_fisico > 
-                  (self.min_dist_lado_direito_fisico + self.margem_decisao_lateral_desvio)):
-                self.get_logger().info(f"--> NAVEGANDO: Mais espaço à ESQUERDA FÍSICA ({self.min_dist_lado_esquerdo_fisico:.2f}m). Virando para ESQUERDA.")
+            elif self.min_dist_lado_esquerdo_fisico > (self.min_dist_lado_direito_fisico + self.margem_decisao_lateral_desvio):
                 twist.angular.z = self.velocidade_giro_desvio_obstaculo
             else:
-                # Decisão aleatória quando os espaços são similares
-                turn_direction = random.choice([-1, 1])
-                self.get_logger().info(f"--> NAVEGANDO: Espaço lateral similar. Virando {'DIREITA' if turn_direction == -1 else 'ESQUERDA'} (aleatório).")
-                twist.angular.z = turn_direction * self.velocidade_giro_desvio_obstaculo
+                twist.angular.z = random.choice([-1, 1]) * self.velocidade_giro_desvio_obstaculo
+
+            self.ultimo_desvio_nav_tempo = tempo_atual
+            self.em_avanco_pos_desvio_nav = True
             return twist
 
-        # Navegação normal até a bandeira
-        twist.angular.z = -self.Kp_angular_nav * angulo_bandeira_camera
+        # --- AVANÇO FORÇADO APÓS O DESVIO ---
+        if self.em_avanco_pos_desvio_nav:
+            if (tempo_atual - self.ultimo_desvio_nav_tempo) < self.duracao_avanco_pos_desvio_nav:
+                twist.linear.x = 0.15  # avança um pouco
+                twist.angular.z = 0.0
+                self.get_logger().debug("Avançando após desvio para afastar do obstáculo (Navegando)...")
+                return twist
+            else:
+                self.get_logger().debug("Avanço pós-desvio finalizado (Navegando). Retomando navegação.")
+                self.em_avanco_pos_desvio_nav = False
 
-        if abs(angulo_bandeira_camera) < self.limiar_angulo_para_avancar_nav: 
-            self.get_logger().debug("Navegando: Bem alinhado. Verificando distância VISUAL para progredir/posicionar.")
-            
-            if distancia_visual_bandeira < self.limiar_distancia_posicionamento:
-                if abs(angulo_bandeira_camera) < self.limiar_angulo_para_posicionamento_final:
-                    self.get_logger().info(f">>> Alvo próximo (DistVis {distancia_visual_bandeira:.2f}m) e BEM ALINHADO. Transição para POSICIONANDO.")
-                    self.mudar_estado(EstadoRobo.POSICIONANDO_PARA_COLETA)
-                    return Twist()
-                else:
-                    self.get_logger().warn(f"Navegando: Perto (DistVis {distancia_visual_bandeira:.2f}m), mas não PERFEITAMENTE alinhado (CAM {angulo_bandeira_camera:.2f}rad). Ajustando ângulo.")
-                    twist.linear.x = 0.0
-            else: 
-                if distancia_visual_bandeira != float('inf') and distancia_visual_bandeira > 0:
-                    twist.linear.x = max(self.velocidade_min_aproximacao_nav, self.Kp_linear_nav * distancia_visual_bandeira)
-                    twist.linear.x = min(twist.linear.x, self.velocidade_max_aproximacao_nav)
-                else: 
-                    twist.linear.x = self.velocidade_min_aproximacao_nav if distancia_visual_bandeira > 0 else 0.0 
+        # --- CONTROLE NORMAL DE NAVEGAÇÃO ---
+        twist.angular.z = -self.Kp_angular_nav * ang_cam
+        if abs(ang_cam) < self.limiar_angulo_para_avancar_nav:
+            if dist_vis < self.limiar_distancia_posicionamento:
+                self.mudar_estado(EstadoRobo.POSICIONANDO_PARA_COLETA)
+                return Twist()
+            else:
+                twist.linear.x = max(self.velocidade_min_aproximacao_nav, self.Kp_linear_nav * dist_vis)
+                twist.linear.x = min(twist.linear.x, self.velocidade_max_aproximacao_nav)
         else:
-            self.get_logger().debug("Navegando: Desalinhado com a bandeira. Priorizando giro (linear.x = 0).")
             twist.linear.x = 0.0
 
         twist.angular.z = np.clip(twist.angular.z, -self.velocidade_max_angular_nav, self.velocidade_max_angular_nav)
-        
         return twist
 
-    # --- Lógica de Posicionamento para Coleta ---
-    def logica_posicionando_para_coleta(self):
-        twist = Twist()
-        self.get_logger().info("Posicionando para coleta...")
 
-        if not self.bandeira_visivel or self.posicao_bandeira_relativa is None:
-            self.get_logger().warn("Posicionando: Bandeira perdida. Voltando a EXPLORAR.")
-            self.mudar_estado(EstadoRobo.EXPLORANDO)
+        dist_vis, ang_cam = self.posicao_bandeira_relativa
+        twist = Twist()
+        
+        if self.obstaculo_a_frente:
+            self.get_logger().warn("Navegando: Obstáculo IMEDIATO. Desviando...")
+            twist.linear.x = 0.0
+            if self.min_dist_lado_direito_fisico > self.min_dist_lado_esquerdo_fisico:
+                twist.angular.z = -self.velocidade_giro_desvio_obstaculo
+            else:
+                twist.angular.z = self.velocidade_giro_desvio_obstaculo
             return twist
 
-        distancia_atual_visual, angulo_atual_camera = self.posicao_bandeira_relativa
-        self.get_logger().debug(f"Posicionando: Angulo_CAM: {angulo_atual_camera:.2f}rad, Dist_VISUAL: {distancia_atual_visual:.2f}m")
+        twist.angular.z = -self.Kp_angular_nav * ang_cam
+        if abs(ang_cam) < self.limiar_angulo_para_avancar_nav:
+            if dist_vis < self.limiar_distancia_posicionamento:
+                self.mudar_estado(EstadoRobo.POSICIONANDO_PARA_COLETA)
+                return Twist()
+            else:
+                twist.linear.x = max(self.velocidade_min_aproximacao_nav, self.Kp_linear_nav * dist_vis)
+                twist.linear.x = min(twist.linear.x, self.velocidade_max_aproximacao_nav)
+        else:
+            twist.linear.x = 0.0
+        
+        twist.angular.z = np.clip(twist.angular.z, -self.velocidade_max_angular_nav, self.velocidade_max_angular_nav)
+        return twist
 
-        erro_distancia = distancia_atual_visual - self.distancia_final_ideal
-        erro_angulo = angulo_atual_camera
+    def logica_posicionando_para_coleta(self):
+        if not self.bandeira_visivel or self.posicao_bandeira_relativa is None:
+            self.mudar_estado(EstadoRobo.EXPLORANDO)
+            return Twist()
 
-        if abs(erro_distancia) < self.tolerancia_distancia and abs(erro_angulo) < self.tolerancia_angulo:
-            self.get_logger().info(f">>> POSICIONAMENTO FINAL CONCLUÍDO! DistVis: {distancia_atual_visual:.2f}m, Angulo: {angulo_atual_camera:.2f}rad")
-            self.mudar_estado(EstadoRobo.MISSAO_CONCLUIDA)
+        dist_vis, ang_cam = self.posicao_bandeira_relativa
+        erro_dist = dist_vis - self.distancia_final_ideal
+        erro_ang = ang_cam
+
+        # --- Lógica de Transição (MODIFICADO) ---
+        if abs(erro_dist) < self.tolerancia_distancia and abs(erro_ang) < self.tolerancia_angulo:
+            self.get_logger().info(f">>> POSICIONAMENTO FINAL CONCLUÍDO! DistVis: {dist_vis:.2f}m, Angulo: {ang_cam:.2f}rad")
+            self.mudar_estado(EstadoRobo.COLETANDO_BANDEIRA) # Mudar para coletar
             return Twist() 
 
-        twist.angular.z = -self.Kp_pos_ang * erro_angulo 
-        
-        if abs(erro_angulo) < (self.tolerancia_angulo * 2.0): 
-            if distancia_atual_visual != float('inf') and distancia_atual_visual > 0:
-                 twist.linear.x = self.Kp_pos_lin * erro_distancia
-            else:
-                 twist.linear.x = 0.0
+        twist = Twist()
+        twist.angular.z = -self.Kp_pos_ang * erro_ang
+        if abs(erro_ang) < (self.tolerancia_angulo * 2.0): 
+            twist.linear.x = self.Kp_pos_lin * erro_dist
         else:
-            twist.linear.x = 0.0 
+            twist.linear.x = 0.0
         
         twist.linear.x = np.clip(twist.linear.x, -self.velocidade_max_linear_pos, self.velocidade_max_linear_pos)
         twist.angular.z = np.clip(twist.angular.z, -self.velocidade_max_angular_pos, self.velocidade_max_angular_pos)
-        
         return twist
-    # --- Lógica de Missão Concluída ---
+
+    # --- Lógicas de Estado (NOVAS) ---
+    def logica_coletando_bandeira(self):
+        self.get_logger().info(f"Coletando bandeira... (Aguardando {self.duracao_coleta_s}s)")
+        
+        tempo_atual = self.get_clock().now().nanoseconds / 1e9
+        if (tempo_atual - self.tempo_inicio_coleta) > self.duracao_coleta_s:
+            self.get_logger().info("Coleta finalizada. Iniciando retorno à base.")
+            self.mudar_estado(EstadoRobo.RETORNANDO_A_BASE)
+            
+        return Twist() # Robô fica parado
+
+    def logica_retornando_a_base(self):
+        twist = Twist()
+        tempo_atual = self.get_clock().now().nanoseconds / 1e9
+
+        if self.odom_atual is None or self.posicao_inicial is None:
+            self.get_logger().warn("Retornando: Odometria inicial ou atual não disponível. Aguardando...")
+            return twist
+
+        # --- DESVIO DE OBSTÁCULO ---
+        if self.obstaculo_a_frente:
+            self.get_logger().warn("Retornando: Obstáculo à frente. Executando desvio inteligente...")
+            twist.linear.x = 0.0
+            if self.min_dist_lado_direito_fisico > (self.min_dist_lado_esquerdo_fisico + self.margem_decisao_lateral_desvio):
+                twist.angular.z = -self.velocidade_giro_desvio_obstaculo
+            elif self.min_dist_lado_esquerdo_fisico > (self.min_dist_lado_direito_fisico + self.margem_decisao_lateral_desvio):
+                twist.angular.z = self.velocidade_giro_desvio_obstaculo
+            else:
+                twist.angular.z = random.choice([-1, 1]) * self.velocidade_giro_desvio_obstaculo
+
+            self.ultimo_desvio_tempo = tempo_atual
+            self.em_avanco_pos_desvio = True
+            return twist
+
+        # --- AVANÇO FORÇADO APÓS O DESVIO ---
+        if self.em_avanco_pos_desvio:
+            if (tempo_atual - self.ultimo_desvio_tempo) < self.duracao_avanco_pos_desvio:
+                twist.linear.x = 0.15  # avança um pouco
+                twist.angular.z = 0.0
+                self.get_logger().debug("Avançando após desvio para afastar do obstáculo...")
+                return twist
+            else:
+                self.get_logger().debug("Avanço pós-desvio finalizado. Retomando navegação.")
+                self.em_avanco_pos_desvio = False
+
+        # --- NAVEGAÇÃO NORMAL PARA BASE ---
+        pos_atual = self.odom_atual.pose.pose.position
+        pos_base = self.posicao_inicial.pose.pose.position
+        distancia_ate_base = math.sqrt((pos_base.x - pos_atual.x)**2 + (pos_base.y - pos_atual.y)**2)
+
+        if distancia_ate_base < self.limiar_distancia_base:
+            self.get_logger().info("CHEGOU À BASE!")
+            self.mudar_estado(EstadoRobo.MISSAO_CONCLUIDA)
+            return Twist()
+
+        yaw_atual = self.euler_from_quaternion(self.odom_atual.pose.pose.orientation)
+        angulo_para_base = math.atan2(pos_base.y - pos_atual.y, pos_base.x - pos_atual.x)
+        erro_angulo = angulo_para_base - yaw_atual
+
+        # Ajuste do erro de ângulo para [-pi, pi]
+        if erro_angulo > math.pi:
+            erro_angulo -= 2 * math.pi
+        elif erro_angulo < -math.pi:
+            erro_angulo += 2 * math.pi
+
+        twist.angular.z = self.Kp_angular_base * erro_angulo
+        if abs(erro_angulo) < self.limiar_angulo_retorno_base:
+            twist.linear.x = self.Kp_linear_base * distancia_ate_base
+            twist.linear.x = min(twist.linear.x, self.velocidade_max_retorno)
+        else:
+            twist.linear.x = 0.0
+
+        return twist
+
+
     def logica_missao_concluida(self):
-        self.get_logger().info("MISSÃO CONCLUÍDA!")
-        return Twist()
+        self.get_logger().info("MISSÃO CONCLUÍDA! O robô irá parar.")
+        return Twist() # Para o robô
 
 # --- Função Principal ---
 def main(args=None):
@@ -488,7 +511,7 @@ def main(args=None):
         try:
             stop_twist = Twist()
             controle_robo_node.cmd_vel_pub.publish(stop_twist)
-            controle_robo_node.get_logger().info("Comando de parada enviado.")
+            controle_robo_node.get_logger().info("Comando de parada final enviado.")
         except Exception as e:
             controle_robo_node.get_logger().warn(f"Não foi possível enviar comando de parada: {e}")
         
